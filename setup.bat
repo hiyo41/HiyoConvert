@@ -81,7 +81,7 @@ if %errorlevel% neq 0 (
             if exist "%%i\bin\ffmpeg.exe" set "FFDIR=%%i\bin"
         )
         if defined FFDIR (
-            set "PATH=!FFDIR!;%PATH%"
+            call :add_to_path "!FFDIR!"
             echo [OK] Found: !FFDIR!
         ) else (
             goto :autodetect_ffmpeg
@@ -110,10 +110,7 @@ goto :manual_ffmpeg
 
 :found_ffmpeg
 echo [OK] Found ffmpeg at: !FFDIR!
-set "PATH=!FFDIR!;%PATH%"
-:: Register in PATH permanently
-setx PATH "!FFDIR!;%PATH%" >nul 2>&1
-echo [OK] ffmpeg added to PATH permanently
+call :add_to_path "!FFDIR!"
 goto :install_pkg
 
 :manual_ffmpeg
@@ -125,9 +122,7 @@ if not exist "!FFDIR!\ffmpeg.exe" (
     echo [!] ffmpeg.exe not found in !FFDIR!
     goto :ffmpeg_fail
 )
-set "PATH=!FFDIR!;%PATH%"
-setx PATH "!FFDIR!;%PATH%" >nul 2>&1
-echo [OK] ffmpeg added to PATH permanently
+call :add_to_path "!FFDIR!"
 goto :install_pkg
 
 :download_ffmpeg
@@ -155,12 +150,22 @@ if not exist "!FFDIR!\ffmpeg.exe" (
     echo [!] Extraction failed.
     goto :ffmpeg_fail
 )
-set "PATH=!FFDIR!;%PATH%"
-setx PATH "!FFDIR!;%PATH%" >nul 2>&1
+call :add_to_path "!FFDIR!"
 echo [OK] ffmpeg downloaded and installed to C:\ffmpeg
 del "%FFZIP%" 2>nul
 rmdir /s /q "%TEMP%\ffmpeg-extract" 2>nul
 goto :install_pkg
+
+rem Add a dir to this session's PATH and, permanently, to the User PATH.
+rem Never do `setx PATH "!D!;%PATH%"` -- %PATH% is Machine+User merged and
+rem setx truncates at 1024 chars, silently corrupting the system PATH.
+:add_to_path
+set "PATH=%~1;%PATH%"
+powershell -NoProfile -Command ^
+    "$d='%~1'; $k='HKCU:\Environment'; $p=[Environment]::GetEnvironmentVariable('Path','User');" ^
+    "if($p -and $p.Split(';') -notcontains $d){[Environment]::SetEnvironmentVariable('Path',(\"$d;$p\"),'User');'added'}" ^
+    "elseif($p){'already'}else{[Environment]::SetEnvironmentVariable('Path',$d,'User');'added'}" 2>nul | findstr /i "added" >nul && echo [OK] ffmpeg added to PATH permanently || echo [WARN] could not update PATH permanently
+goto :eof
 
 :ffmpeg_fail
 echo.
