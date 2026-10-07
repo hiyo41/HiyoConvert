@@ -10,6 +10,21 @@
 __pycache__/
 *.pyc
 
+# Runtime output
+*.wma
+*.ac3
+*.alac
+*.mp2
+*.aiff
+*.dts
+*.amr
+*.ape
+*.wv
+*.tta
+*.spx
+*.au
+hiyo-convert_errors.log
+
 # Private
 AGENTS.md
 
