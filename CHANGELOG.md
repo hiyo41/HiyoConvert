@@ -23,5 +23,7 @@
 - Persistent UI language; `[L]` changes it from the menu.
 - `--force` for deliberate same-format re-encodes.
 - CI on Windows and Linux (Python 3.11 and 3.13), Ruff, Dependabot.
+  Runs once per branch (push to `main` plus PRs) and cancels superseded runs.
+- Dependencies: yt-dlp 2026.10.26+, ruff 0.17.5+, checkout/setup-python v7.
 - LICENSE file and accurate README.
 - `test_v22.py` regression tests for the fixes above.
