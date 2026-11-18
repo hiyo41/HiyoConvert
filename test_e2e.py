@@ -138,7 +138,7 @@ class TestConvertFile(unittest.TestCase):
             with self.subTest(ext=ext):
                 src = make_audio(self.root / f"l{ext}.wav")
                 info = hc.CODECS[ext]
-                s = hc.Settings(quality=10)
+                s = hc.Settings(quality=10, force=True)
                 status, _, _, _, detail = hc.convert_file(src, self.root / f"out{ext}",
                                                          info["codec"], info, s)
                 self.assertEqual(status, "ok", detail)

@@ -47,6 +47,12 @@ if %errorlevel% neq 0 (
 )
 echo [OK] Python: 
 python --version
+python -c "import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)"
+if %errorlevel% neq 0 (
+    echo [!] Python 3.11 or newer is required.
+    pause
+    exit /b 1
+)
 
 :: ------------------------------------------------------------
 :: Check / Install ffmpeg
