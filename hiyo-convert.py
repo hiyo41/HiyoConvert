@@ -8,6 +8,8 @@ Design notes:
   - Quality is one number 1-10, mapped per codec by quality_params().
 """
 
+__version__ = "2.2.0"
+
 import argparse
 import io
 import json
@@ -20,8 +22,9 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from itertools import islice
 from pathlib import Path
 
 
@@ -225,6 +228,7 @@ LANG = {
         "downloading": "Downloading",
         "playlist": "playlist",
         "src_filter": "Source filter",
+        "language": "Language / Ngôn ngữ",
     },
     "vi": {
         "title": "=== HiyoConvert ===",
@@ -312,6 +316,7 @@ LANG = {
         "downloading": "Đang tải",
         "playlist": "danh sách",
         "src_filter": "Lọc nguồn",
+        "language": "Ngôn ngữ / Language",
     },
 }
 
@@ -382,6 +387,7 @@ CHANNELS = [0, 2, 1]
 class Settings:
     FIELDS = ("quality", "output_dir", "sample_rate", "channels", "normalize",
               "strip_meta", "simplify", "keep", "dry_run", "strip_diacritics")
+    EXTRA_FIELDS = ("force",)
 
     def __init__(self, **kw):
         self.quality = 5
@@ -394,8 +400,9 @@ class Settings:
         self.keep = False
         self.dry_run = False
         self.strip_diacritics = False
+        self.force = False
         for k, v in kw.items():
-            if k in self.FIELDS:
+            if k in self.FIELDS or k in self.EXTRA_FIELDS:
                 setattr(self, k, v)
 
     def to_dict(self):
@@ -416,17 +423,31 @@ class Settings:
             payload = self.to_dict()
             if lang:
                 payload["lang"] = lang
-            CONFIG_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            tmp = CONFIG_PATH.with_name(CONFIG_PATH.name + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            os.replace(tmp, CONFIG_PATH)
             return True
         except OSError:
             return False
 
     @staticmethod
     def load():
-        try:
-            return Settings.from_dict(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-        except (OSError, ValueError):
-            return None
+        data = load_config()
+        return Settings.from_dict(data) if data else None
+
+
+def load_config():
+    """Raw saved config, or an empty dict when missing/corrupt."""
+    try:
+        data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_saved_lang():
+    lang = load_config().get("lang")
+    return lang if lang in LANG else None
 
 
 # --------------------------------------------------------------------------
@@ -538,6 +559,37 @@ def safe_stem(name):
     return stem
 
 
+_INVALID_FS = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
+
+
+def safe_filename(name, max_len=120):
+    """Make a remote title safe as a single path component.
+
+    Download titles are untrusted: they can contain '/', ':', '?' or be
+    longer than the filesystem limit. Keep the readable text, replace
+    forbidden characters, and never return an empty or reserved name.
+    """
+    name = unicodedata.normalize("NFKC", str(name or ""))
+    name = _INVALID_FS.sub("_", name)
+    name = re.sub(r"\s+", " ", name).strip().strip(". ")
+    if len(name) > max_len:
+        name = name[:max_len].rstrip(". ")
+    return safe_stem(name) if name else "untitled"
+
+
+def unique_path(parent, stem, ext, reserved):
+    """Collision-free destination, also reserving names planned this run."""
+    path = parent / f"{stem}{ext}"
+    n = 1
+    key = str(path).lower()
+    while path.exists() or key in reserved:
+        path = parent / f"{stem}_{n}{ext}"
+        key = str(path).lower()
+        n += 1
+    reserved.add(key)
+    return path
+
+
 def output_parent(src, settings, root=None):
     """Where the converted file goes. Preserves the source's subfolder."""
     if not settings.output_dir:
@@ -550,7 +602,7 @@ def output_parent(src, settings, root=None):
     return settings.output_dir
 
 
-def get_output_path(src, dst_ext, settings, root=None):
+def get_output_path(src, dst_ext, settings, root=None, create=True, reserved=None):
     name = src.stem
     if settings.simplify:
         name = simplify_name(name)
@@ -558,13 +610,40 @@ def get_output_path(src, dst_ext, settings, root=None):
         name = strip_diacritics(name)
     name = safe_stem(name)
     parent = output_parent(src, settings, root)
+    if create:
+        parent.mkdir(parents=True, exist_ok=True)
+    if reserved is None:
+        reserved = set()
+    return unique_path(parent, name, dst_ext, reserved)
+
+
+def plan_jobs(files, dst_ext, settings, root=None):
+    """Build (src, dst, display) jobs without racing on duplicate names.
+
+    Collisions are reserved in memory. This matters when simplify or
+    strip-diacritics maps two different source names onto one destination:
+    checking only dst.exists() would hand both jobs the same path.
+    Dry-run must not create directories, so create is disabled there.
+    """
+    reserved = set()
+    jobs = []
+    for f in files:
+        dst = get_output_path(f, dst_ext, settings, root,
+                              create=not settings.dry_run, reserved=reserved)
+        jobs.append((f, dst, get_short_name(f.stem)))
+    return jobs
+
+
+def plan_download_jobs(got, tgt_ext, settings):
+    """Turn downloaded (path, title) pairs into safe, collision-free jobs."""
+    parent = settings.output_dir or Path.cwd()
     parent.mkdir(parents=True, exist_ok=True)
-    dst = parent / f"{name}{dst_ext}"
-    n = 1
-    while dst.exists():
-        dst = parent / f"{name}_{n}{dst_ext}"
-        n += 1
-    return dst
+    reserved = set()
+    jobs = []
+    for path, title in got:
+        dst = unique_path(parent, safe_filename(title), tgt_ext, reserved)
+        jobs.append((path, dst, title))
+    return jobs
 
 
 def get_short_name(name):
@@ -671,6 +750,17 @@ def build_ffmpeg_cmd(src, dst, codec, codec_info, settings):
     return cmd
 
 
+def same_format(src, dst, settings):
+    """True when re-encoding would only lose quality.
+
+    Same-extension conversions are pointless unless the user asks for a
+    real change (sample rate, channels, normalize) or passes --force.
+    """
+    if settings.force or settings.sample_rate or settings.channels or settings.normalize:
+        return False
+    return src.suffix.lower() == dst.suffix.lower()
+
+
 def convert_file(src, dst, codec, codec_info, settings, display=None):
     """Convert one file. Returns (status, name, orig_size, new_size, detail).
 
@@ -679,6 +769,8 @@ def convert_file(src, dst, codec, codec_info, settings, display=None):
     name = display or get_short_name(src.stem)
     if src.resolve() == dst.resolve() or dst.exists():
         return "skip", name, 0, 0, ""
+    if same_format(src, dst, settings):
+        return "skip", name, 0, 0, "same format (use --force to re-encode)"
     try:
         orig_size = src.stat().st_size
     except OSError as e:
@@ -851,76 +943,215 @@ def run_batch(jobs, codec, codec_info, settings, threads=None):
 # YouTube / Spotify
 # --------------------------------------------------------------------------
 
+SPOTIFY_PAGE = "https://open.spotify.com/embed/{kind}/{sid}"
+_SPOTIFY_URL = re.compile(
+    r"^https?://(?:open\.)?spotify\.com/(?:intl-[a-z-]+/)?"
+    r"(track|album|playlist|episode|show)/([A-Za-z0-9]+)",
+    re.IGNORECASE,
+)
+_SPOTIFY_SHORT = re.compile(r"^https?://spotify\.link/", re.IGNORECASE)
+_YT_URL = re.compile(r"^https?://(?:[\w-]+\.)?(?:youtube\.com|youtu\.be)/", re.IGNORECASE)
+_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) HiyoConvert/2.2"
+
+
+def classify_url(url):
+    """Return 'youtube', 'spotify' or None. Pure, so it is unit-tested."""
+    if _YT_URL.match(url):
+        return "youtube"
+    if _SPOTIFY_URL.match(url) or _SPOTIFY_SHORT.match(url):
+        return "spotify"
+    return None
+
+
+def _http_get(url, timeout=25):
+    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace"), resp.geturl()
+
+
+def _spotify_parts(url):
+    """Extract (kind, id) from a Spotify URL, following spotify.link."""
+    if _SPOTIFY_SHORT.match(url):
+        try:
+            _, final = _http_get(url)
+        except (urllib.error.URLError, OSError):
+            return None, None
+        url = final
+    m = _SPOTIFY_URL.match(url)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def _split_artists(subtitle):
+    # Spotify's embed separates artists with a thin space (U+2009), often
+    # after a real comma: "A,\u2009B". Normalize both forms to "A, B".
+    text = (subtitle or "").strip()
+    text = re.sub(r"\s*,\s*[\u2009\u00a0]\s*", ", ", text)
+    return re.sub(r"[\u2009\u00a0]+", ", ", text)
+
+
+def parse_spotify_embed(html):
+    """Parse the __NEXT_DATA__ blob in a Spotify embed page.
+
+    Works without an API key. Track pages carry one entity; album and
+    playlist pages carry a trackList. Pure, so fixtures can test it.
+    """
+    m = re.search(
+        r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>',
+        html,
+        re.S,
+    )
+    if not m:
+        return []
+    try:
+        data = json.loads(m.group(1))
+        entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+    except (ValueError, KeyError, TypeError):
+        return []
+
+    if entity.get("type") == "track":
+        title = entity.get("title") or entity.get("name") or ""
+        artists = [a.get("name") for a in entity.get("artists") or [] if a.get("name")]
+        return [{"title": title, "artist": ", ".join(artists)}] if title else []
+
+    tracks = []
+    for item in entity.get("trackList") or []:
+        title = item.get("title") or ""
+        if title:
+            tracks.append({"title": title, "artist": _split_artists(item.get("subtitle"))})
+    return tracks
+
+
+def spotify_metadata(url):
+    """Resolve a track/album/playlist URL to [{title, artist}]."""
+    kind, sid = _spotify_parts(url)
+    if not kind:
+        cprint(f"  {C.RED}[!] {tr('invalid_url')}: {url}{C.RST}")
+        return []
+    if kind in ("episode", "show"):
+        cprint(f"  {C.RED}[!] Spotify {kind} URLs are not supported{C.RST}")
+        return []
+    try:
+        html, _ = _http_get(SPOTIFY_PAGE.format(kind=kind, sid=sid))
+    except (urllib.error.URLError, OSError) as e:
+        cprint(f"  {C.RED}[{tr('fail')}]{C.RST} {url}  {C.LG}{e}{C.RST}")
+        return []
+    tracks = parse_spotify_embed(html)
+    if not tracks:
+        cprint(f"  {C.RED}[{tr('fail')}]{C.RST} {url}  {C.LG}no tracks in embed{C.RST}")
+    return tracks
+
+
+def _entry_filepath(info, temp_dir):
+    """Find the file yt-dlp wrote for one video entry."""
+    if not info:
+        return None
+    # ytsearch1: returns a playlist-shaped wrapper; unwrap its first video.
+    entries = info.get("entries")
+    if entries:
+        for entry in entries:
+            if entry:
+                return _entry_filepath(entry, temp_dir)
+        return None
+    for item in info.get("requested_downloads") or []:
+        path = item.get("filepath") or item.get("_filename")
+        if path and Path(path).exists():
+            return Path(path)
+    vid = info.get("id") or ""
+    ext = info.get("ext") or ""
+    if vid and ext:
+        path = temp_dir / f"{vid}.{ext}"
+        if path.exists():
+            return path
+    if vid:
+        return next(
+            (f for f in temp_dir.iterdir() if f.is_file() and f.name.startswith(vid)),
+            None,
+        )
+    return None
+
+
 def download_youtube(url, temp_dir):
+    """Download a video or every entry of a playlist. Returns [(path, title)]."""
     try:
         import yt_dlp
     except ImportError:
         cprint(f"  {C.RED}[!] pip install yt-dlp{C.RST}")
-        return None
+        return []
     out = str(temp_dir / "%(id)s.%(ext)s")
     opts = {"format": "bestaudio/best", "outtmpl": out, "quiet": True,
-            "no_warnings": True, "noprogress": True}
+            "no_warnings": True, "noprogress": True, "noplaylist": True}
     try:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            vid = info.get("id") or ""
-            ext = info.get("ext") or "webm"
-            path = temp_dir / f"{vid}.{ext}"
-            if not path.exists():
-                path = next((f for f in temp_dir.iterdir()
-                             if f.is_file() and f.name.startswith(vid)), None)
-            return (path, info.get("title") or "unknown") if path else None
     except Exception as e:  # noqa: BLE001 - yt_dlp raises many types
         cprint(f"  {C.RED}[{tr('fail')}]{C.RST} {url}  {C.LG}{e}{C.RST}")
-        return None
+        return []
+
+    entries = list(info.get("entries") or [info]) if info else []
+    got = []
+    for entry in entries:
+        if not entry:
+            continue
+        path = _entry_filepath(entry, temp_dir)
+        if path:
+            got.append((path, entry.get("title") or path.stem))
+    if not got:
+        cprint(f"  {C.RED}[{tr('fail')}]{C.RST} {url}  {C.LG}{tr('no_files')}{C.RST}")
+    return got
 
 
-def download_spotify(url, temp_dir):
-    """Spotify has no public audio API. Resolve each track via yt-dlp's search
-    and take the best YouTube match. NOT Spotify's audio."""
+def download_spotify(url, temp_dir, threads=None):
+    """Resolve Spotify metadata, then fetch the best YouTube match per track.
+
+    Spotify has no public audio API. The embed page gives title/artists;
+    yt-dlp searches YouTube for each one. NOT Spotify's audio.
+    """
     try:
         import yt_dlp
     except ImportError:
         cprint(f"  {C.RED}[!] pip install yt-dlp{C.RST}")
         return []
-    try:
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "extract_flat": True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception as e:  # noqa: BLE001
-        cprint(f"  {C.RED}[{tr('fail')}]{C.RST} {url}  {C.LG}{e}{C.RST}")
-        return []
 
-    entries = [e for e in (info.get("entries") or []) if e]
-    if not entries:
-        entries = [info]
-    kind = tr("playlist") if len(entries) > 1 else tr("title")
-    cprint(f"  {C.LG}[{kind}] {info.get('title', '?')}: {len(entries)} {tr('files')}{C.RST}")
+    tracks = spotify_metadata(url)
+    if not tracks:
+        return []
+    cprint(f"  {C.LG}[Spotify] {len(tracks)}{C.RST}")
 
     out = str(temp_dir / "%(id)s.%(ext)s")
     opts = {"format": "bestaudio/best", "outtmpl": out, "quiet": True,
             "no_warnings": True, "noprogress": True}
-    results = []
+    errors = []
     lock = threading.Lock()
 
-    def one(entry):
-        track = entry.get("track") or entry.get("title") or "unknown"
-        artist = entry.get("artist") or entry.get("uploader") or ""
-        query = f"{artist} - {track}" if artist else track
+    def one(track):
+        title = track.get("title") or ""
+        artist = track.get("artist") or ""
+        query = f"{artist} - {title}" if artist else title
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                v = ydl.extract_info(f"ytsearch1:{query}", download=True)
-            if v and v.get("id"):
-                path = temp_dir / f"{v['id']}.{v.get('ext', 'webm')}"
-                with lock:
-                    results.append((path if path.exists() else None, query))
-        except Exception:  # noqa: BLE001
+                info = ydl.extract_info(f"ytsearch1:{query}", download=True)
+            path = _entry_filepath(info, temp_dir)
+            if path:
+                return (path, query)
             with lock:
-                results.append((None, query))
+                errors.append((query, tr("no_files")))
+            return None
+        except Exception as e:  # noqa: BLE001 - one track must not kill the list
+            with lock:
+                errors.append((query, str(e)[:200]))
+            return None
 
-    workers = max(1, min(os.cpu_count() or 2, len(entries)))
+    workers = threads or max(1, min(4, len(tracks)))
+    workers = max(1, min(workers, len(tracks)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        list(pool.map(one, entries))
-    return results
+        results = list(pool.map(one, tracks))
+    got = [r for r in results if r]
+    failed = len(results) - len(got)
+    if failed:
+        cprint(f"  {C.YLW}[!] {failed}/{len(results)} {tr('fail')}{C.RST}")
+        for query, detail in errors[:3]:
+            cprint(f"    {C.RED}✗{C.RST} {query}  {C.LG}{detail}{C.RST}")
+    return got
 
 
 def download_urls(urls, temp_dir, threads=None):
@@ -929,15 +1160,16 @@ def download_urls(urls, temp_dir, threads=None):
 
     def one(item):
         kind, url = item
-        res = download_spotify(url, temp_dir) if kind == "spotify" else [download_youtube(url, temp_dir)]
+        if kind == "spotify":
+            res = download_spotify(url, temp_dir, threads)
+        else:
+            res = download_youtube(url, temp_dir)
         for path, title in res:
-            if path is not None:
-                with lock:
-                    got.append((path, title))
-            else:
-                with lock:
-                    cprint(f"  {C.RED}[{tr('fail')}]{C.RST} {title or url}")
+            with lock:
+                got.append((path, title))
 
+    if not urls:
+        return got
     cprint(f"\n  {C.BOLD}{C.CYN}╒ {tr('downloading')} ({len(urls)}){C.RST}")
     workers = threads or max(1, min(os.cpu_count() or 2, len(urls)))
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -1028,15 +1260,16 @@ def input_urls():
     urls = []
     while True:
         line = ask("  › ").strip()
+        if line == "\x03":
+            raise Abort
         if not line:
             break
         if line.lower() in ("q", "quit"):
             raise Abort
         for part in re.split(r"[,\s]+", line):
-            if re.match(r"^https?://(www\.)?(youtube\.com|youtu\.be)/", part, re.I):
-                urls.append(("youtube", part))
-            elif "spotify.com" in part.lower():
-                urls.append(("spotify", part))
+            kind = classify_url(part)
+            if kind:
+                urls.append((kind, part))
             else:
                 cprint(f"  {C.YLW}[!] {tr('invalid_url')}: {part}{C.RST}")
     if not urls:
@@ -1082,6 +1315,8 @@ def draw_menu(settings, root, src_type, src_ext, tgt_ext, codec_info):
         filt = tr("all") if src_ext is None else src_ext
         cprint(f"  {C.BOLD}[F]{C.RST} {tr('src_filter')}: {C.WHT}{filt}{C.RST}")
     cprint(f"  {C.BOLD}[D]{C.RST} {tr('change_dir')}:  {C.WHT}{root}{C.RST}")
+    lang_name = "Tiếng Việt" if L is LANG["vi"] else "English"
+    cprint(f"  {C.BOLD}[L]{C.RST} {tr('language')}: {C.WHT}{lang_name}{C.RST}")
     cprint(f"\n  {C.BOLD}{C.CYN}╘ {tr('settings_hdr')}{C.RST}")
     _, qlabel = quality_params(codec_info, settings.quality)
     od = str(settings.output_dir) if settings.output_dir else tr("none")
@@ -1166,8 +1401,7 @@ def run_local(settings, root, src_ext, tgt_ext, codec, codec_info, threads=None)
         cprint(f"  {C.YLW}[!] {tr('no_files')}{C.RST}")
         return
     cprint(f"  {tr('found')} {C.BOLD}{len(files)}{C.RST} {tr('files')}")
-    jobs = [(f, get_output_path(f, tgt_ext, settings, root), get_short_name(f.stem))
-            for f in files]
+    jobs = plan_jobs(files, tgt_ext, settings, root)
     if settings.dry_run:
         preview(jobs, tgt_ext, settings)
         return
@@ -1198,10 +1432,6 @@ def preview(jobs, tgt_ext, settings):
 
 def run_url(settings, tgt_ext, codec, codec_info, threads=None):
     urls = input_urls()
-    cprint(f"\n  {C.BOLD}{C.CYN}╒ {tr('target')}{C.RST}")
-    item = pick_menu(TGT_FORMATS)
-    tgt_ext, codec = item[1], item[3]
-    codec_info = CODECS[tgt_ext]
     if settings.dry_run:
         clear_screen()
         cprint(f"\n  {C.BOLD}{C.CYN}╒═ {tr('dry_run_title')}{C.RST}")
@@ -1220,20 +1450,13 @@ def run_url(settings, tgt_ext, codec, codec_info, threads=None):
             cprint(f"  {C.YLW}[!] {tr('no_files')}{C.RST}")
             return
         clear_screen()
-        jobs = []
-        for path, title in got:
-            parent = settings.output_dir or Path.cwd()
-            parent.mkdir(parents=True, exist_ok=True)
-            dst = parent / f"{title}{tgt_ext}"
-            n = 1
-            while dst.exists():
-                dst = parent / f"{title}_{n}{tgt_ext}"
-                n += 1
-            jobs.append((path, dst, title))
-        # keep=True: files live in a temp dir we delete anyway, and keeping
-        # them lets the size comparison report something meaningful.
-        settings.keep = True
-        run_batch(jobs, codec, codec_info, settings, threads)
+        jobs = plan_download_jobs(got, tgt_ext, settings)
+        # Temp files are deleted in finally, so keep=True is only about the
+        # size report; never mutate the user's saved setting.
+        batch_settings = Settings.from_dict(settings.to_dict())
+        batch_settings.keep = True
+        batch_settings.force = settings.force
+        run_batch(jobs, codec, codec_info, batch_settings, threads)
     finally:
         shutil.rmtree(temp, ignore_errors=True)
 
@@ -1242,7 +1465,7 @@ def menu_loop():
     global L
     cfg = Settings.load()
     settings = cfg or Settings()
-    lang = "vi" if sys.platform != "win32" else "en"
+    lang = load_saved_lang()
     root = Path.cwd()
     src_ext = None
     src_type = "local"
@@ -1250,8 +1473,12 @@ def menu_loop():
 
     clear_screen()
     show_banner()
-    lang = choose_language()
-    L = LANG[lang]
+    if lang:
+        L = LANG[lang]
+    else:
+        lang = choose_language()
+        L = LANG[lang]
+        settings.save(lang)
     if not shutil.which("ffmpeg"):
         cprint(f"\n  {C.RED}[!] {tr('no_ffmpeg')}{C.RST}\n")
         press_enter()
@@ -1289,6 +1516,11 @@ def menu_loop():
                 clear_screen()
             elif key == "d":
                 root = pick_directory()
+                clear_screen()
+            elif key == "l":
+                lang = choose_language()
+                L = LANG[lang]
+                settings.save(lang)
                 clear_screen()
             else:
                 edit_setting(settings, key, codec_info)
@@ -1328,20 +1560,24 @@ def build_parser():
     p.add_argument("--simplify", action="store_true", help="clean up filenames")
     p.add_argument("--strip-diacritics", action="store_true", help="remove Vietnamese tones")
     p.add_argument("--keep", action="store_true", help="keep originals (default: delete)")
+    p.add_argument("--force", action="store_true", help="re-encode even when source and target formats match")
     p.add_argument("--dry-run", action="store_true", help="list what would happen")
     p.add_argument("-j", "--threads", type=int, help="parallel ffmpeg processes")
-    p.add_argument("--lang", choices=["en", "vi"], help="UI language for --dry-run output")
+    p.add_argument("--lang", choices=["en", "vi"], help="UI language")
     p.add_argument("--config", action="store_true", help="print saved settings and exit")
-    p.add_argument("--version", action="version", version="HiyoConvert 2.0")
+    p.add_argument("--version", action="version", version=f"HiyoConvert {__version__}")
     return p
 
 
 def run_cli(args):
     global L
     saved = Settings.load()
+    lang = args.lang or load_saved_lang() or ("vi" if sys.platform != "win32" else "en")
     if args.config:
-        L = LANG[args.lang or (sys.platform != "win32" and "vi" or "en")]
-        print(json.dumps((saved or Settings()).to_dict(), indent=2))
+        L = LANG[lang]
+        payload = (saved or Settings()).to_dict()
+        payload["lang"] = lang
+        print(json.dumps(payload, indent=2))
         return 0
     if not args.to:
         print("error: --to is required in CLI mode (or run with no arguments for the menu)",
@@ -1351,7 +1587,7 @@ def run_cli(args):
         print(f"error: {tr('no_ffmpeg')}", file=sys.stderr)
         return 1
 
-    L = LANG[args.lang or (sys.platform != "win32" and "vi" or "en")]
+    L = LANG[lang]
     tgt_ext = args.to if args.to.startswith(".") else f".{args.to}"
     if tgt_ext not in CODECS:
         print(f"error: unknown target {tgt_ext}. Choose from: {' '.join(CODECS.keys())}",
@@ -1366,6 +1602,10 @@ def run_cli(args):
     src_ext = args.src.lower() if args.src else None
     if src_ext and not src_ext.startswith("."):
         src_ext = f".{src_ext}"
+    if src_ext and src_ext not in ALL_AUDIO_EXTS:
+        print(f"error: unknown source format {src_ext}. Choose from: "
+              f"{' '.join(sorted(ALL_AUDIO_EXTS))}", file=sys.stderr)
+        return 2
 
     settings = saved or Settings()
     for flag, attr in (("quality", "quality"), ("normalize", "normalize"),
@@ -1375,13 +1615,16 @@ def run_cli(args):
         val = getattr(args, flag)
         if val is not None and val is not False:
             setattr(settings, attr, val)
+    if args.force:
+        settings.force = True
     if args.out:
         settings.output_dir = Path(args.out).expanduser().resolve()
-        settings.output_dir.mkdir(parents=True, exist_ok=True)
     if args.sample_rate:
         settings.sample_rate = args.sample_rate
     if args.channels:
         settings.channels = args.channels
+    if settings.output_dir and not settings.dry_run:
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
 
     cprint(f"  {tr('scanning')} {root}...", C.DIM)
     dirs = scan_dirs(root, src_ext)
@@ -1391,8 +1634,7 @@ def run_cli(args):
         return 1
     cprint(f"  {tr('found')} {len(files)} {tr('files')}")
 
-    jobs = [(f, get_output_path(f, tgt_ext, settings, root), get_short_name(f.stem))
-            for f in files]
+    jobs = plan_jobs(files, tgt_ext, settings, root)
     if settings.dry_run:
         preview(jobs, tgt_ext, settings)
         return 0

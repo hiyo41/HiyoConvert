@@ -92,6 +92,10 @@ if [ -z "$PYTHON" ]; then
 fi
 
 echo " [OK] Python: $($PYTHON --version 2>&1)"
+if ! $PYTHON -c 'import sys; sys.exit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo " [!] Python 3.11 or newer is required."
+    exit 1
+fi
 
 # ------------------------------------------------------------
 # Check / Install pip

@@ -135,7 +135,6 @@ class TestGetOutputPath(unittest.TestCase):
                          self.src.with_name("track.mp3"))
 
     def test_creates_out_dir(self):
-        out = self.root / "out"
         dst = hc.get_output_path(self.src, ".mp3", self.s, root=self.root)
         self.assertEqual(dst.parent, self.src.parent)
 
