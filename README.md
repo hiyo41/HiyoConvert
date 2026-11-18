@@ -3,7 +3,7 @@
 > Batch audio converter with multithreading — fast, smart, easy.
 > Công cụ chuyển đổi audio hàng loạt với đa luồng — nhanh, thông minh, dễ dùng.
 
-[![CI](https://github.com/hiyo412012/HiyoConvert/actions/workflows/ci.yml/badge.svg)](https://github.com/hiyo412012/HiyoConvert/actions/workflows/ci.yml)
+[![CI](https://github.com/hiyo41/HiyoConvert/actions/workflows/ci.yml/badge.svg)](https://github.com/hiyo41/HiyoConvert/actions/workflows/ci.yml)
 
 One menu screen, one progress bar, a CLI for scripting, and 123 tests over the
 logic that decides filenames, ffmpeg arguments, URL parsing and job planning.
